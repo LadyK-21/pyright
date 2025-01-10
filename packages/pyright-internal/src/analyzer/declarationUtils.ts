@@ -7,7 +7,9 @@
  * Collection of static methods that operate on declarations.
  */
 
+import { assertNever } from '../common/debug';
 import { getEmptyRange } from '../common/textRange';
+import { Uri } from '../common/uri/uri';
 import { NameNode, ParseNodeType } from '../parser/parseNodes';
 import { ImportLookup, ImportLookupResult } from './analyzerFileInfo';
 import { AliasDeclaration, Declaration, DeclarationType, ModuleLoaderActions, isAliasDeclaration } from './declaration';
@@ -27,29 +29,26 @@ export function hasTypeForDeclaration(declaration: Declaration): boolean {
         case DeclarationType.Class:
         case DeclarationType.SpecialBuiltInClass:
         case DeclarationType.Function:
-        case DeclarationType.TypeParameter:
+        case DeclarationType.TypeParam:
         case DeclarationType.TypeAlias:
             return true;
 
-        case DeclarationType.Parameter: {
-            if (declaration.node.typeAnnotation || declaration.node.typeAnnotationComment) {
+        case DeclarationType.Param: {
+            if (declaration.node.d.annotation || declaration.node.d.annotationComment) {
                 return true;
             }
 
             // Handle function type comments.
             const parameterParent = declaration.node.parent;
             if (parameterParent?.nodeType === ParseNodeType.Function) {
-                if (
-                    parameterParent.functionAnnotationComment &&
-                    !parameterParent.functionAnnotationComment.isParamListEllipsis
-                ) {
-                    const paramAnnotations = parameterParent.functionAnnotationComment.paramTypeAnnotations;
+                if (parameterParent.d.funcAnnotationComment && !parameterParent.d.funcAnnotationComment.d.isEllipsis) {
+                    const paramAnnotations = parameterParent.d.funcAnnotationComment.d.paramAnnotations;
 
                     // Handle the case where the annotation comment is missing an
                     // annotation for the first parameter (self or cls).
                     if (
-                        parameterParent.parameters.length > paramAnnotations.length &&
-                        declaration.node === parameterParent.parameters[0]
+                        parameterParent.d.params.length > paramAnnotations.length &&
+                        declaration.node === parameterParent.d.params[0]
                     ) {
                         return false;
                     }
@@ -78,7 +77,7 @@ export function areDeclarationsSame(
         return false;
     }
 
-    if (decl1.path !== decl2.path) {
+    if (!decl1.uri.equals(decl2.uri)) {
         return false;
     }
 
@@ -109,7 +108,7 @@ export function areDeclarationsSame(
             return true;
         }
 
-        if (decl1.firstNamePart !== decl2.firstNamePart) {
+        if (decl1.node !== decl2.node) {
             return false;
         }
     }
@@ -124,19 +123,26 @@ export function getNameFromDeclaration(declaration: Declaration) {
 
         case DeclarationType.Class:
         case DeclarationType.Function:
-        case DeclarationType.TypeParameter:
+        case DeclarationType.TypeParam:
         case DeclarationType.TypeAlias:
-            return declaration.node.name.value;
+            return declaration.node.d.name.d.value;
 
-        case DeclarationType.Parameter:
-            return declaration.node.name?.value;
+        case DeclarationType.Param:
+            return declaration.node.d.name?.d.value;
 
         case DeclarationType.Variable:
-            return declaration.node.nodeType === ParseNodeType.Name ? declaration.node.value : undefined;
+            return declaration.node.nodeType === ParseNodeType.Name ? declaration.node.d.value : undefined;
 
         case DeclarationType.Intrinsic:
         case DeclarationType.SpecialBuiltInClass:
-            return undefined;
+            return declaration.node.nodeType === ParseNodeType.TypeAnnotation &&
+                declaration.node.d.valueExpr.nodeType === ParseNodeType.Name
+                ? declaration.node.d.valueExpr.d.value
+                : undefined;
+
+        default: {
+            assertNever(declaration);
+        }
     }
 
     throw new Error(`Shouldn't reach here`);
@@ -146,19 +152,19 @@ export function getNameNodeForDeclaration(declaration: Declaration): NameNode | 
     switch (declaration.type) {
         case DeclarationType.Alias:
             if (declaration.node.nodeType === ParseNodeType.ImportAs) {
-                return declaration.node.alias ?? declaration.node.module.nameParts[0];
+                return declaration.node.d.alias ?? declaration.node.d.module.d.nameParts[0];
             } else if (declaration.node.nodeType === ParseNodeType.ImportFromAs) {
-                return declaration.node.alias ?? declaration.node.name;
+                return declaration.node.d.alias ?? declaration.node.d.name;
             } else {
-                return declaration.node.module.nameParts[0];
+                return declaration.node.d.module.d.nameParts[0];
             }
 
         case DeclarationType.Class:
         case DeclarationType.Function:
-        case DeclarationType.TypeParameter:
-        case DeclarationType.Parameter:
+        case DeclarationType.TypeParam:
+        case DeclarationType.Param:
         case DeclarationType.TypeAlias:
-            return declaration.node.name;
+            return declaration.node.d.name;
 
         case DeclarationType.Variable:
             return declaration.node.nodeType === ParseNodeType.Name ? declaration.node : undefined;
@@ -166,21 +172,25 @@ export function getNameNodeForDeclaration(declaration: Declaration): NameNode | 
         case DeclarationType.Intrinsic:
         case DeclarationType.SpecialBuiltInClass:
             return undefined;
+
+        default: {
+            assertNever(declaration);
+        }
     }
 
     throw new Error(`Shouldn't reach here`);
 }
 
-export function isDefinedInFile(decl: Declaration, filePath: string) {
+export function isDefinedInFile(decl: Declaration, fileUri: Uri) {
     if (isAliasDeclaration(decl)) {
         // Alias decl's path points to the original symbol
         // the alias is pointing to. So, we need to get the
         // filepath in that the alias is defined from the node.
-        return getFileInfoFromNode(decl.node)?.filePath === filePath;
+        return getFileInfoFromNode(decl.node)?.fileUri.equals(fileUri);
     }
 
     // Other decls, the path points to the file the symbol is defined in.
-    return decl.path === filePath;
+    return decl.uri.equals(fileUri);
 }
 
 export function getDeclarationsWithUsesLocalNameRemoved(decls: Declaration[]) {
@@ -196,13 +206,13 @@ export function getDeclarationsWithUsesLocalNameRemoved(decls: Declaration[]) {
     });
 }
 
-export function createSynthesizedAliasDeclaration(path: string): AliasDeclaration {
+export function synthesizeAliasDeclaration(uri: Uri): AliasDeclaration {
     // The only time this decl is used is for IDE services such as
     // the find all references, hover provider and etc.
     return {
         type: DeclarationType.Alias,
         node: undefined!,
-        path,
+        uri,
         loadSymbolsFromPath: false,
         range: getEmptyRange(),
         implicitImports: new Map<string, ModuleLoaderActions>(),
@@ -264,8 +274,10 @@ export function resolveAliasDeclaration(
         }
 
         let lookupResult: ImportLookupResult | undefined;
-        if (curDeclaration.path && curDeclaration.loadSymbolsFromPath) {
-            lookupResult = importLookup(curDeclaration.path, { skipFileNeededCheck: options.skipFileNeededCheck });
+        if (!curDeclaration.uri.isEmpty() && curDeclaration.loadSymbolsFromPath) {
+            lookupResult = importLookup(curDeclaration.uri, {
+                skipFileNeededCheck: options.skipFileNeededCheck,
+            });
         }
 
         const symbol: Symbol | undefined = lookupResult
@@ -281,11 +293,11 @@ export function resolveAliasDeclaration(
                     // when useLibraryCodeForTypes is disabled), b should be evaluated as Unknown,
                     // not as a module.
                     if (
-                        curDeclaration.path &&
+                        !curDeclaration.uri.isEmpty() &&
                         curDeclaration.submoduleFallback.type === DeclarationType.Alias &&
-                        curDeclaration.submoduleFallback.path
+                        !curDeclaration.submoduleFallback.uri.isEmpty()
                     ) {
-                        const lookupResult = importLookup(curDeclaration.submoduleFallback.path, {
+                        const lookupResult = importLookup(curDeclaration.submoduleFallback.uri, {
                             skipFileNeededCheck: options.skipFileNeededCheck,
                             skipParsing: true,
                         });
@@ -295,7 +307,19 @@ export function resolveAliasDeclaration(
                     }
                 }
 
-                return resolveAliasDeclaration(importLookup, curDeclaration.submoduleFallback, options);
+                let submoduleFallback = curDeclaration.submoduleFallback;
+                if (curDeclaration.symbolName) {
+                    submoduleFallback = { ...curDeclaration.submoduleFallback };
+                    let baseModuleName = submoduleFallback.moduleName;
+
+                    if (baseModuleName) {
+                        baseModuleName = `${baseModuleName}.`;
+                    }
+
+                    submoduleFallback.moduleName = `${baseModuleName}${curDeclaration.symbolName}`;
+                }
+
+                return resolveAliasDeclaration(importLookup, submoduleFallback, options);
             }
 
             // If the symbol comes from a native library, we won't
@@ -310,7 +334,7 @@ export function resolveAliasDeclaration(
             return undefined;
         }
 
-        if (symbol.isPrivateMember()) {
+        if (symbol.isPrivateMember() && !sawPyTypedTransition) {
             isPrivate = true;
         }
 
@@ -340,6 +364,8 @@ export function resolveAliasDeclaration(
             return undefined;
         }
 
+        const prevDeclaration = curDeclaration;
+
         // Prefer the last unvisited declaration in the list. This ensures that
         // we use all of the overloads if it's an overloaded function.
         const unvisitedDecls = declarations.filter((decl) => !alreadyVisited.includes(decl));
@@ -352,7 +378,7 @@ export function resolveAliasDeclaration(
         if (lookupResult?.isInPyTypedPackage) {
             if (!sawPyTypedTransition) {
                 if (symbol.isPrivatePyTypedImport()) {
-                    privatePyTypedImporter = curDeclaration?.moduleName;
+                    privatePyTypedImporter = prevDeclaration?.moduleName;
                 }
 
                 // Note that we've seen a transition from a non-py.typed to a py.typed
@@ -375,11 +401,7 @@ export function resolveAliasDeclaration(
             // imports a submodule using itself as the import target. For example, if
             // the module is foo, and the foo.__init__.py file contains the statement
             // "from foo import bar", we want to import the foo/bar.py submodule.
-            if (
-                curDeclaration.path === declaration.path &&
-                curDeclaration.type === DeclarationType.Alias &&
-                curDeclaration.submoduleFallback
-            ) {
+            if (curDeclaration.type === DeclarationType.Alias && curDeclaration.submoduleFallback) {
                 return resolveAliasDeclaration(importLookup, curDeclaration.submoduleFallback, options);
             }
             return {

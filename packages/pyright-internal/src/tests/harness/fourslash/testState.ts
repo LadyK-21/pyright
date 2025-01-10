@@ -6,6 +6,7 @@
  * TestState wraps currently test states and provides a way to query and manipulate
  * the test states.
  */
+
 import assert from 'assert';
 import * as path from 'path';
 import {
@@ -18,6 +19,7 @@ import {
     DocumentHighlight,
     DocumentHighlightKind,
     ExecuteCommandParams,
+    Location,
     MarkupContent,
     MarkupKind,
     TextEdit,
@@ -26,32 +28,33 @@ import {
 
 import { BackgroundAnalysisProgramFactory, InvalidatedReason } from '../../../analyzer/backgroundAnalysisProgram';
 import { ImportResolver, ImportResolverFactory } from '../../../analyzer/importResolver';
+import { PackageTypeReport } from '../../../analyzer/packageTypeReport';
+import { PackageTypeVerifier } from '../../../analyzer/packageTypeVerifier';
 import { findNodeByOffset } from '../../../analyzer/parseTreeUtils';
 import { Program } from '../../../analyzer/program';
 import { AnalyzerService } from '../../../analyzer/service';
 import { CommandResult } from '../../../commands/commandResult';
 import { Char } from '../../../common/charCodes';
+import { CommandLineOptions } from '../../../common/commandLineOptions';
 import { ConfigOptions, SignatureDisplayType } from '../../../common/configOptions';
-import { ConsoleInterface, NullConsole } from '../../../common/console';
-import { Comparison, isNumber, isString, toBoolean } from '../../../common/core';
+import { ConsoleInterface, ConsoleWithLogLevel, NullConsole } from '../../../common/console';
+import { Comparison, isNumber, isString } from '../../../common/core';
 import * as debug from '../../../common/debug';
 import { DiagnosticCategory } from '../../../common/diagnostic';
+import { PyrightDocStringService } from '../../../common/docStringService';
 import { FileEditAction } from '../../../common/editAction';
-import {
-    combinePaths,
-    convertPathToUri,
-    getDirectoryPath,
-    getFileExtension,
-    getFileSpec,
-    normalizePath,
-    normalizeSlashes,
-    setTestingMode,
-} from '../../../common/pathUtils';
+import { ReadOnlyFileSystem } from '../../../common/fileSystem';
+import { LanguageServerInterface } from '../../../common/languageServerInterface';
+import { getFileExtension, normalizePath, normalizeSlashes } from '../../../common/pathUtils';
 import { convertOffsetToPosition, convertPositionToOffset } from '../../../common/positionUtils';
+import { ServiceProvider } from '../../../common/serviceProvider';
+import { createServiceProvider } from '../../../common/serviceProviderExtensions';
+import { compareStringsCaseInsensitive, compareStringsCaseSensitive } from '../../../common/stringUtils';
 import { DocumentRange, Position, Range as PositionRange, TextRange, rangesAreEqual } from '../../../common/textRange';
 import { TextRangeCollection } from '../../../common/textRangeCollection';
+import { Uri } from '../../../common/uri/uri';
+import { UriEx, getFileSpec } from '../../../common/uri/uriUtils';
 import { convertToWorkspaceEdit } from '../../../common/workspaceEditUtils';
-import { LanguageServerInterface } from '../../../languageServerBase';
 import { CallHierarchyProvider } from '../../../languageService/callHierarchyProvider';
 import { CompletionOptions, CompletionProvider } from '../../../languageService/completionProvider';
 import {
@@ -60,21 +63,17 @@ import {
     TypeDefinitionProvider,
 } from '../../../languageService/definitionProvider';
 import { DocumentHighlightProvider } from '../../../languageService/documentHighlightProvider';
+import { CollectionResult } from '../../../languageService/documentSymbolCollector';
 import { HoverProvider } from '../../../languageService/hoverProvider';
 import { convertDocumentRangesToLocation } from '../../../languageService/navigationUtils';
 import { ReferencesProvider } from '../../../languageService/referencesProvider';
 import { RenameProvider } from '../../../languageService/renameProvider';
 import { SignatureHelpProvider } from '../../../languageService/signatureHelpProvider';
 import { ParseNode } from '../../../parser/parseNodes';
-import { ParseResults } from '../../../parser/parser';
+import { ParseFileResults } from '../../../parser/parser';
 import { Tokenizer } from '../../../parser/tokenizer';
 import { PyrightFileSystem } from '../../../pyrightFileSystem';
-import {
-    WellKnownWorkspaceKinds,
-    Workspace,
-    WorkspacePythonPathKind,
-    createInitStatus,
-} from '../../../workspaceFactory';
+import { NormalWorkspace, WellKnownWorkspaceKinds, Workspace, createInitStatus } from '../../../workspaceFactory';
 import { TestAccessHost } from '../testAccessHost';
 import * as host from '../testHost';
 import { stringify } from '../utils';
@@ -84,7 +83,6 @@ import { parseTestData } from './fourSlashParser';
 import {
     FourSlashData,
     FourSlashFile,
-    GlobalMetadataOptionNames,
     Marker,
     MetadataOptionNames,
     MultiMap,
@@ -92,11 +90,14 @@ import {
     TestCancellationToken,
 } from './fourSlashTypes';
 import { TestFeatures, TestLanguageService } from './testLanguageService';
-import { createVfsInfoFromFourSlashData, getMarkerByName, getMarkerName, getMarkerNames } from './testStateUtils';
+import {
+    createVfsInfoFromFourSlashData,
+    getMarkerByName,
+    getMarkerName,
+    getMarkerNames,
+    getRangeByMarkerName,
+} from './testStateUtils';
 import { verifyWorkspaceEdit } from './workspaceEditTestUtils';
-import { ServiceProvider } from '../../../common/serviceProvider';
-import { createServiceProvider } from '../../../common/serviceProviderExtensions';
-import { compareStringsCaseInsensitive, compareStringsCaseSensitive } from '../../../common/stringUtils';
 
 export interface TextChange {
     span: TextRange;
@@ -107,10 +108,9 @@ export interface HostSpecificFeatures {
     importResolverFactory: ImportResolverFactory;
     backgroundAnalysisProgramFactory: BackgroundAnalysisProgramFactory;
 
-    runIndexer(workspace: Workspace, noStdLib: boolean, options?: string): void;
     getCodeActionsForPosition(
         workspace: Workspace,
-        filePath: string,
+        fileUri: Uri,
         range: PositionRange,
         token: CancellationToken
     ): Promise<CodeAction[]>;
@@ -118,7 +118,8 @@ export interface HostSpecificFeatures {
     execute(ls: LanguageServerInterface, params: ExecuteCommandParams, token: CancellationToken): Promise<any>;
 }
 
-const testAccessHost = new TestAccessHost(vfs.MODULE_PATH, [libFolder, distlibFolder]);
+// Make sure everything is in lower case since it has hard coded `isCaseSensitive`: true.
+const testAccessHost = new TestAccessHost(UriEx.file(vfs.MODULE_PATH), [libFolder, distlibFolder]);
 
 export class TestState {
     private readonly _cancellationToken: TestCancellationToken;
@@ -128,7 +129,7 @@ export class TestState {
 
     readonly testFS: vfs.TestFileSystem;
     readonly fs: PyrightFileSystem;
-    readonly workspace: Workspace;
+    readonly workspace: NormalWorkspace;
     readonly console: ConsoleInterface;
     readonly rawConfigJson: any | undefined;
     readonly serviceProvider: ServiceProvider;
@@ -166,22 +167,25 @@ export class TestState {
                 mountPaths
             );
 
-        this.console = new NullConsole();
+        this.fs = new PyrightFileSystem(this.testFS);
+        this.console = new ConsoleWithLogLevel(new NullConsole(), 'test');
+        this.serviceProvider = createServiceProvider(this.testFS, this.fs, this.console);
+
         this._cancellationToken = new TestCancellationToken();
         this._hostSpecificFeatures = hostSpecificFeatures ?? new TestFeatures();
 
-        this.fs = new PyrightFileSystem(this.testFS);
         this.files = vfsInfo.sourceFileNames;
 
         this.rawConfigJson = vfsInfo.rawConfigJson;
         const configOptions = this._convertGlobalOptionsToConfigOptions(vfsInfo.projectRoot, mountPaths);
 
         if (this.rawConfigJson) {
-            configOptions.initializeFromJson(this.rawConfigJson, 'basic', this.console, this.fs, testAccessHost);
+            const configDirUri = Uri.file(projectRoot, this.serviceProvider);
+            configOptions.initializeTypeCheckingMode('standard');
+            configOptions.initializeFromJson(this.rawConfigJson, configDirUri, this.serviceProvider, testAccessHost);
+            configOptions.setupExecutionEnvironments(this.rawConfigJson, configDirUri, this.serviceProvider.console());
             this._applyTestConfigOptions(configOptions);
         }
-
-        this.serviceProvider = createServiceProvider(this.fs, this.console);
 
         const service = this._createAnalysisService(
             this.console,
@@ -192,33 +196,20 @@ export class TestState {
 
         this.workspace = {
             workspaceName: 'test workspace',
-            rootPath: vfsInfo.projectRoot,
-            pythonPath: undefined,
-            pythonPathKind: WorkspacePythonPathKind.Mutable,
-            uri: convertPathToUri(this.fs, vfsInfo.projectRoot),
+            rootUri: Uri.file(vfsInfo.projectRoot, this.serviceProvider),
             kinds: [WellKnownWorkspaceKinds.Test],
             service: service,
             disableLanguageServices: false,
+            disableTaggedHints: false,
             disableOrganizeImports: false,
             disableWorkspaceSymbol: false,
             isInitialized: createInitStatus(),
             searchPathsToWatch: [],
-            pythonEnvironmentName: undefined,
         };
-
-        const indexer = toBoolean(testData.globalOptions[GlobalMetadataOptionNames.indexer]);
-        const indexerWithoutStdLib = toBoolean(testData.globalOptions[GlobalMetadataOptionNames.indexerWithoutStdLib]);
-        if (indexer || indexerWithoutStdLib) {
-            const indexerOptions = testData.globalOptions[GlobalMetadataOptionNames.indexerOptions];
-            configOptions.indexing = true;
-            this._hostSpecificFeatures.runIndexer(this.workspace, indexerWithoutStdLib, indexerOptions);
-        }
 
         if (!delayFileInitialization) {
             this.initializeFiles();
         }
-
-        setTestingMode(true);
     }
 
     get importResolver(): ImportResolver {
@@ -233,6 +224,16 @@ export class TestState {
         return this.workspace.service.test_program;
     }
 
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    get BOF(): number {
+        return 0;
+    }
+
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    get EOF(): number {
+        return this.getFileContent(this.activeFile.fileName).length;
+    }
+
     initializeFiles() {
         if (this.files.length > 0) {
             // Open the first file by default
@@ -242,7 +243,7 @@ export class TestState {
         for (const filePath of this.files) {
             const file = this._vfsFiles[filePath] as vfs.File;
             if (file.meta?.[MetadataOptionNames.ipythonMode]) {
-                this.program.getSourceFile(filePath)?.test_enableIPythonMode(true);
+                this.program.getSourceFile(Uri.file(filePath, this.serviceProvider))?.test_enableIPythonMode(true);
             }
         }
     }
@@ -281,8 +282,9 @@ export class TestState {
     }
 
     getMappedFilePath(path: string): string {
-        this.importResolver.ensurePartialStubPackages(this.configOptions.findExecEnvironment(path));
-        return this.fs.getMappedFilePath(path);
+        const uri = Uri.file(path, this.serviceProvider);
+        this.importResolver.ensurePartialStubPackages(this.configOptions.findExecEnvironment(uri));
+        return this.fs.getMappedUri(uri).getFilePath();
     }
 
     getMarkerName(m: Marker): string {
@@ -333,14 +335,6 @@ export class TestState {
         return this.convertOffsetsToRange(range.fileName, range.pos, range.end);
     }
 
-    convertPathToUri(path: string) {
-        return convertPathToUri(this.fs, path);
-    }
-
-    getDirectoryPath(path: string) {
-        return getDirectoryPath(path);
-    }
-
     getPathSep() {
         return path.sep;
     }
@@ -379,7 +373,12 @@ export class TestState {
     selectLine(index: number) {
         const lineStart = this.convertPositionToOffset(this.activeFile.fileName, { line: index, character: 0 });
         const lineEnd = lineStart + this._getLineContent(index).length;
-        this.selectRange({ fileName: this.activeFile.fileName, pos: lineStart, end: lineEnd });
+        this.selectRange({
+            fileName: this.activeFile.fileName,
+            fileUri: this.activeFile.fileUri,
+            pos: lineStart,
+            end: lineEnd,
+        });
     }
 
     goToEachRange(action: (range: Range) => void) {
@@ -421,17 +420,15 @@ export class TestState {
     }
 
     getRangeByMarkerName(markerName: string): Range | undefined {
-        const marker = this.getMarkerByName(markerName);
-        return this.getRanges().find((r) => r.marker === marker);
+        return getRangeByMarkerName(this.testData, markerName);
     }
 
     goToBOF() {
-        this.goToPosition(0);
+        this.goToPosition(this.BOF);
     }
 
     goToEOF() {
-        const len = this.getFileContent(this.activeFile.fileName).length;
-        this.goToPosition(len);
+        this.goToPosition(this.EOF);
     }
 
     moveCaretRight(count = 1) {
@@ -449,7 +446,7 @@ export class TestState {
         fileToOpen.fileName = normalizeSlashes(fileToOpen.fileName);
         this.activeFile = fileToOpen;
 
-        this.program.setFileOpened(this.activeFile.fileName, 1, fileToOpen.content);
+        this.program.setFileOpened(this.activeFile.fileUri, 1, fileToOpen.content);
 
         return fileToOpen;
     }
@@ -659,8 +656,8 @@ export class TestState {
             resultPerFile: Map<
                 string,
                 {
-                    filePath: string;
-                    parseResults: ParseResults | undefined;
+                    fileUri: Uri;
+                    parseResults: ParseFileResults | undefined;
                     errors: Diagnostic[];
                     warnings: Diagnostic[];
                 }
@@ -680,7 +677,7 @@ export class TestState {
         verifyMode: _.FourSlashVerificationMode,
         map: {
             [marker: string]: {
-                codeActions: { title: string; kind: string; command?: Command; edit?: WorkspaceEdit[] }[];
+                codeActions: { title: string; kind: string; command?: Command; edit?: WorkspaceEdit }[];
             };
         }
     ): Promise<any> {
@@ -688,11 +685,32 @@ export class TestState {
         this.workspace.service.invalidateAndForceReanalysis(InvalidatedReason.Reanalyzed);
         this.analyze();
 
+        // calling `analyze` should have parse and bind all or open user files. make sure that's true at least for open files.
+        for (const info of this.program.getOpened()) {
+            if (!info.sourceFile.getModuleSymbolTable()) {
+                this.console.error(
+                    `Module symbol missing?: ${info.sourceFile.getUri()}, bound: ${!info.sourceFile.isBindingRequired}`
+                );
+
+                // Make sure it is bound.
+                this.program.getBoundSourceFile(info.sourceFile.getUri());
+            }
+        }
+
+        // Local copy to use in capture.
+        const serviceProvider = this.serviceProvider;
         for (const range of this.getRanges()) {
             const name = this.getMarkerName(range.marker!);
             if (!map[name]) {
                 continue;
             }
+
+            const uri = Uri.file(range.fileName, this.serviceProvider);
+            const sourceFile = this.program.getSourceFile(uri);
+            if (!sourceFile) {
+                this.raiseError(`source file not found: ${range.fileName}`);
+            }
+            const diagnostics = sourceFile.getDiagnostics(this.configOptions) || [];
 
             const codeActions = await this._getCodeActions(range);
             if (verifyMode === 'exact') {
@@ -735,16 +753,41 @@ export class TestState {
                 if (verifyMode === 'excluded' && matches.length > 0) {
                     this.raiseError(`unexpected result: ${stringify(map[name])}`);
                 } else if (verifyMode !== 'excluded' && matches.length !== 1) {
+                    const uri = Uri.file('test2.py', this.serviceProvider);
+                    const sourceFile = this.program.getSourceFile(uri);
+                    const symbolsInTest2 = sourceFile
+                        ? ', symbols in test2.py: ' +
+                          Array.from(sourceFile.getModuleSymbolTable()?.keys() ?? []).join(',')
+                        : '';
+
                     this.raiseError(
-                        `doesn't contain expected result: ${stringify(expected)}, actual: ${stringify(codeActions)}`
+                        `doesn't contain expected result: ${stringify(expected)}, actual: ${stringify(
+                            codeActions
+                        )}, diagnostics: ${stringify(diagnostics)}${symbolsInTest2}`
                     );
                 }
             }
         }
 
         function convertToString(args: any[] | undefined): string[] | undefined {
+            if (args) {
+                // Trim `undefined` from the args.
+                while (args.length > 0) {
+                    if (args[args.length - 1] === undefined) {
+                        args.pop();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
             return args?.map((a) => {
                 if (isString(a)) {
+                    // Might be a URI. For comparison purposes in a test, convert it into a
+                    // file path.
+                    if (a.startsWith('file://')) {
+                        return normalizeSlashes(Uri.parse(a, serviceProvider).getFilePath());
+                    }
                     return normalizeSlashes(a);
                 }
 
@@ -755,6 +798,15 @@ export class TestState {
 
     async verifyCommand(command: Command, files: { [filePath: string]: string }): Promise<any> {
         this.analyze();
+
+        // Convert command arguments to file Uri strings. That's the expected input for command arguments.
+        const convertedArgs = command.arguments?.map((arg) => {
+            if (typeof arg === 'string' && (arg.endsWith('.py') || arg.endsWith('.pyi'))) {
+                return Uri.file(arg, this.serviceProvider).toString();
+            }
+            return arg;
+        });
+        command.arguments = convertedArgs;
 
         const commandResult = await this._hostSpecificFeatures.execute(
             new TestLanguageService(this.workspace, this.console, this.fs),
@@ -782,8 +834,8 @@ export class TestState {
         return commandResult;
     }
 
-    verifyWorkspaceEdit(expected: WorkspaceEdit, actual: WorkspaceEdit) {
-        return verifyWorkspaceEdit(expected, actual);
+    verifyWorkspaceEdit(expected: WorkspaceEdit, actual: WorkspaceEdit, marker?: string) {
+        return verifyWorkspaceEdit(expected, actual, marker);
     }
 
     async verifyInvokeCodeAction(
@@ -806,7 +858,9 @@ export class TestState {
             if (verifyCodeActionCount) {
                 if (codeActions.length !== Object.keys(map).length) {
                     this.raiseError(
-                        `doesn't contain expected result: ${stringify(map[name])}, actual: ${stringify(codeActions)}`
+                        `doesn't contain expected result count: ${stringify(map[name])}, actual: ${stringify(
+                            codeActions
+                        )}`
                     );
                 }
             }
@@ -862,7 +916,7 @@ export class TestState {
             const rangePos = this.convertOffsetsToRange(range.fileName, range.pos, range.end);
             const provider = new HoverProvider(
                 this.program,
-                range.fileName,
+                range.fileUri,
                 rangePos.start,
                 kind,
                 CancellationToken.None
@@ -1079,12 +1133,13 @@ export class TestState {
 
             const actual = new SignatureHelpProvider(
                 this.program,
-                fileName,
+                Uri.file(fileName, this.serviceProvider),
                 position,
                 docFormat,
-                /*hasSignatureLabelOffsetCapability*/ true,
-                /*hasActiveParameterCapability*/ true,
-                /*context*/ undefined,
+                /* hasSignatureLabelOffsetCapability */ true,
+                /* hasActiveParameterCapability */ true,
+                /* context */ undefined,
+                new PyrightDocStringService(),
                 CancellationToken.None
             ).getSignatureHelp();
 
@@ -1136,33 +1191,44 @@ export class TestState {
         }
     }
 
-    verifyFindAllReferences(map: {
-        [marker: string]: {
-            references: DocumentRange[];
-        };
-    }) {
+    verifyFindAllReferences(
+        map: {
+            [marker: string]: {
+                references: DocumentRange[];
+            };
+        },
+        createDocumentRange?: (fileUri: Uri, result: CollectionResult, parseResults: ParseFileResults) => DocumentRange,
+        convertToLocation?: (fs: ReadOnlyFileSystem, ranges: DocumentRange) => Location | undefined
+    ) {
         this.analyze();
 
-        for (const marker of this.getMarkers()) {
+        for (const name of this.getMarkerNames()) {
+            const marker = this.getMarkerByName(name);
             const fileName = marker.fileName;
-            const name = this.getMarkerName(marker);
 
             if (!(name in map)) {
                 continue;
             }
 
-            const expected = map[name].references;
+            let expected = map[name].references;
+            expected = expected.map((c) => {
+                return {
+                    ...c,
+                    uri: c.uri ?? Uri.file((c as any).path, this.serviceProvider),
+                };
+            });
 
             const position = this.convertOffsetToPosition(fileName, marker.position);
 
-            const actual = new ReferencesProvider(this.program, CancellationToken.None).reportReferences(
-                fileName,
-                position,
-                /* includeDeclaration */ true
-            );
+            const actual = new ReferencesProvider(
+                this.program,
+                CancellationToken.None,
+                createDocumentRange,
+                convertToLocation
+            ).reportReferences(Uri.file(fileName, this.serviceProvider), position, /* includeDeclaration */ true);
             assert.strictEqual(actual?.length ?? 0, expected.length, `${name} has failed`);
 
-            for (const r of convertDocumentRangesToLocation(this.program.fileSystem, expected)) {
+            for (const r of convertDocumentRangesToLocation(this.program.fileSystem, expected, convertToLocation)) {
                 assert.equal(actual?.filter((d) => this._deepEqual(d, r)).length, 1);
             }
         }
@@ -1190,7 +1256,7 @@ export class TestState {
             const position = this.convertOffsetToPosition(fileName, marker.position);
             const actual = new CallHierarchyProvider(
                 this.program,
-                fileName,
+                Uri.file(fileName, this.serviceProvider),
                 position,
                 CancellationToken.None
             ).getIncomingCalls();
@@ -1205,7 +1271,7 @@ export class TestState {
                     assert.strictEqual(expectedName?.filter((e) => this._deepEqual(a.from.name, e)).length, 1);
                     assert.ok(
                         expectedFilePath?.filter((e) =>
-                            this._deepEqual(a.from.uri, convertPathToUri(this.program.fileSystem, e))
+                            this._deepEqual(a.from.uri, Uri.file(e, this.serviceProvider).toString())
                         ).length >= 1
                     );
                 }
@@ -1235,7 +1301,7 @@ export class TestState {
             const position = this.convertOffsetToPosition(fileName, marker.position);
             const actual = new CallHierarchyProvider(
                 this.program,
-                fileName,
+                Uri.file(fileName, this.serviceProvider),
                 position,
                 CancellationToken.None
             ).getOutgoingCalls();
@@ -1249,7 +1315,7 @@ export class TestState {
                     assert.strictEqual(expectedName?.filter((e) => this._deepEqual(a.to.name, e)).length, 1);
                     assert.ok(
                         expectedFilePath?.filter((e) =>
-                            this._deepEqual(a.to.uri, convertPathToUri(this.program.fileSystem, e))
+                            this._deepEqual(a.to.uri, Uri.file(e, this.serviceProvider).toString())
                         ).length >= 1
                     );
                 }
@@ -1287,7 +1353,7 @@ export class TestState {
             const position = this.convertOffsetToPosition(fileName, marker.position);
             const actual = new DocumentHighlightProvider(
                 this.program,
-                fileName,
+                Uri.file(fileName, this.serviceProvider),
                 position,
                 CancellationToken.None
             ).getDocumentHighlight();
@@ -1303,6 +1369,16 @@ export class TestState {
                 }
             }
         }
+    }
+
+    fixupDefinitionsToMatchExpected(actual: DocumentRange[] | undefined): any {
+        return actual?.map((a) => {
+            const { uri, ...restOfActual } = a;
+            return {
+                ...restOfActual,
+                path: uri.getFilePath(),
+            };
+        });
     }
 
     verifyFindDefinitions(
@@ -1324,25 +1400,26 @@ export class TestState {
             }
 
             const expected = map[name].definitions;
-
+            const uri = Uri.file(fileName, this.serviceProvider);
             // If we're going to def from a file, act like it's open.
-            if (!this.program.getSourceFileInfo(fileName)) {
+            if (!this.program.getSourceFileInfo(uri)) {
                 const file = this.testData.files.find((v) => v.fileName === fileName);
                 if (file) {
-                    this.program.setFileOpened(fileName, file.version, file.content);
+                    this.program.setFileOpened(uri, file.version, file.content);
                 }
             }
 
             const position = this.convertOffsetToPosition(fileName, marker.position);
-            const actual = new DefinitionProvider(
+            let actual = new DefinitionProvider(
                 this.program,
-                fileName,
+                uri,
                 position,
                 filter,
                 CancellationToken.None
             ).getDefinitions();
 
             assert.equal(actual?.length ?? 0, expected.length, `No definitions found for marker "${name}"`);
+            actual = this.fixupDefinitionsToMatchExpected(actual!);
 
             for (const r of expected) {
                 assert.equal(
@@ -1372,12 +1449,13 @@ export class TestState {
             const expected = map[name].definitions;
 
             const position = this.convertOffsetToPosition(fileName, marker.position);
-            const actual = new TypeDefinitionProvider(
+            let actual = new TypeDefinitionProvider(
                 this.program,
-                fileName,
+                Uri.file(fileName, this.serviceProvider),
                 position,
                 CancellationToken.None
             ).getDefinitions();
+            actual = this.fixupDefinitionsToMatchExpected(actual!);
 
             assert.strictEqual(actual?.length ?? 0, expected.length, name);
 
@@ -1407,19 +1485,57 @@ export class TestState {
             }
 
             const expected = map[name];
+            expected.changes = expected.changes.map((c) => {
+                return {
+                    ...c,
+                    fileUri: c.fileUri ?? Uri.file((c as any).filePath, this.serviceProvider),
+                };
+            });
 
             const position = this.convertOffsetToPosition(fileName, marker.position);
-            const actual = new RenameProvider(this.program, fileName, position, CancellationToken.None).renameSymbol(
-                expected.newName,
-                /* isDefaultWorkspace */ false,
+            const actual = new RenameProvider(
+                this.program,
                 isUntitled
-            );
+                    ? Uri.parse(`untitled:${fileName.replace(/\\/g, '/')}`, this.serviceProvider)
+                    : Uri.file(fileName, this.serviceProvider),
+                position,
+                CancellationToken.None
+            ).renameSymbol(expected.newName, /* isDefaultWorkspace */ false, isUntitled);
 
             verifyWorkspaceEdit(
                 convertToWorkspaceEdit(this.program.fileSystem, { edits: expected.changes, fileOperations: [] }),
                 actual ?? { documentChanges: [] }
             );
         }
+    }
+
+    verifyTypeVerifierResults(
+        packageName: string,
+        ignoreUnknownTypesFromImports: boolean,
+        verboseOutput: boolean,
+        expected: PackageTypeReport
+    ) {
+        const commandLineOptions = new CommandLineOptions(
+            this.configOptions.projectRoot.getFilePath(),
+            /* fromLanguageServer */ false
+        );
+        commandLineOptions.configSettings.verboseOutput = verboseOutput;
+        const verifier = new PackageTypeVerifier(
+            this.serviceProvider,
+            testAccessHost,
+            commandLineOptions,
+            packageName,
+            ignoreUnknownTypesFromImports
+        );
+        const report = verifier.verify();
+
+        assert.strictEqual(report.generalDiagnostics.length, expected.generalDiagnostics.length);
+        assert.strictEqual(report.missingClassDocStringCount, expected.missingClassDocStringCount);
+        assert.strictEqual(report.missingDefaultParamCount, expected.missingDefaultParamCount);
+        assert.strictEqual(report.missingFunctionDocStringCount, expected.missingFunctionDocStringCount);
+        assert.strictEqual(report.moduleName, expected.moduleName);
+        assert.strictEqual(report.packageName, expected.packageName);
+        assert.deepStrictEqual(Array.from(report.symbols.keys()), Array.from(expected.symbols.keys()));
     }
 
     setCancelled(numberOfCalls: number): void {
@@ -1493,8 +1609,7 @@ export class TestState {
 
         const provider = new CompletionProvider(
             this.program,
-            this.workspace.rootPath,
-            filePath,
+            Uri.file(filePath, this.serviceProvider),
             completionPosition,
             options,
             CancellationToken.None
@@ -1589,7 +1704,7 @@ export class TestState {
     }
 
     private _convertGlobalOptionsToConfigOptions(projectRoot: string, mountPaths?: Map<string, string>): ConfigOptions {
-        const configOptions = new ConfigOptions(projectRoot);
+        const configOptions = new ConfigOptions(Uri.file(projectRoot, this.serviceProvider));
 
         // add more global options as we need them
         const newConfigOptions = this._applyTestConfigOptions(configOptions, mountPaths);
@@ -1609,17 +1724,17 @@ export class TestState {
 
         // make sure we set typing path
         if (configOptions.stubPath === undefined) {
-            configOptions.stubPath = normalizePath(combinePaths(vfs.MODULE_PATH, 'typings'));
+            configOptions.stubPath = Uri.file(vfs.MODULE_PATH, this.serviceProvider).combinePaths('typings');
         }
 
-        configOptions.include.push(getFileSpec(this.fs, configOptions.projectRoot, '.'));
-        configOptions.exclude.push(getFileSpec(this.fs, configOptions.projectRoot, typeshedFolder));
-        configOptions.exclude.push(getFileSpec(this.fs, configOptions.projectRoot, distlibFolder));
-        configOptions.exclude.push(getFileSpec(this.fs, configOptions.projectRoot, libFolder));
+        configOptions.include.push(getFileSpec(configOptions.projectRoot, '.'));
+        configOptions.exclude.push(getFileSpec(configOptions.projectRoot, typeshedFolder.getFilePath()));
+        configOptions.exclude.push(getFileSpec(configOptions.projectRoot, distlibFolder.getFilePath()));
+        configOptions.exclude.push(getFileSpec(configOptions.projectRoot, libFolder.getFilePath()));
 
         if (mountPaths) {
             for (const mountPath of mountPaths.keys()) {
-                configOptions.exclude.push(getFileSpec(this.fs, configOptions.projectRoot, mountPath));
+                configOptions.exclude.push(getFileSpec(configOptions.projectRoot, mountPath));
             }
         }
 
@@ -1630,18 +1745,21 @@ export class TestState {
         return configOptions;
     }
 
-    private _getParseResult(fileName: string) {
-        const file = this.program.getBoundSourceFile(fileName)!;
-        return file.getParseResults()!;
+    private _getParserOutput(fileName: string) {
+        const file = this.program.getBoundSourceFile(Uri.file(fileName, this.serviceProvider))!;
+        return file?.getParseResults();
     }
 
     private _getTextRangeCollection(fileName: string): TextRangeCollection<TextRange> {
-        if (fileName in this.files) {
-            return this._getParseResult(fileName).tokenizerOutput.lines;
+        if (this.files.includes(fileName)) {
+            const tokenizerOutput = this._getParserOutput(fileName)?.tokenizerOutput;
+            if (tokenizerOutput) {
+                return tokenizerOutput.lines;
+            }
         }
 
         // slow path
-        const fileContents = this.fs.readFileSync(fileName, 'utf8');
+        const fileContents = this.fs.readFileSync(Uri.file(fileName, this.serviceProvider), 'utf8');
         const tokenizer = new Tokenizer();
         return tokenizer.tokenize(fileContents).lines;
     }
@@ -1658,7 +1776,14 @@ export class TestState {
     }
 
     private _editScriptAndUpdateMarkers(fileName: string, editStart: number, editEnd: number, newText: string) {
-        // this.languageServiceAdapterHost.editScript(fileName, editStart, editEnd, newText);
+        let fileContent = this.getFileContent(fileName);
+        fileContent = fileContent.slice(0, editStart) + newText + fileContent.slice(editEnd);
+        const uri = Uri.file(fileName, this.serviceProvider);
+
+        this.testFS.writeFileSync(uri, fileContent, 'utf8');
+        const newVersion = (this.program.getSourceFile(uri)?.getClientVersion() ?? -1) + 1;
+        this.program.setFileOpened(uri, newVersion, fileContent);
+
         for (const marker of this.testData.markers) {
             if (marker.fileName === fileName) {
                 marker.position = this._updatePosition(marker.position, editStart, editEnd, newText);
@@ -1808,20 +1933,23 @@ export class TestState {
     }
 
     private _getDiagnosticsPerFile() {
-        const sourceFiles = this.files.map((f) => this.program.getSourceFile(f));
+        const sourceFiles = this.files.map((f) => this.program.getSourceFile(Uri.file(f, this.serviceProvider)));
         const results = sourceFiles.map((sourceFile, index) => {
             if (sourceFile) {
                 const diagnostics = sourceFile.getDiagnostics(this.configOptions) || [];
-                const filePath = sourceFile.getFilePath();
+                const fileUri = sourceFile.getUri();
                 const value = {
-                    filePath,
+                    fileUri,
                     parseResults: sourceFile.getParseResults(),
                     errors: diagnostics.filter((diag) => diag.category === DiagnosticCategory.Error),
                     warnings: diagnostics.filter((diag) => diag.category === DiagnosticCategory.Warning),
                     information: diagnostics.filter((diag) => diag.category === DiagnosticCategory.Information),
                     unused: diagnostics.filter((diag) => diag.category === DiagnosticCategory.UnusedCode),
                 };
-                return [filePath, value] as [string, typeof value];
+
+                // Don't use the uri key, but rather the file name, because other spots
+                // in the test data assume file paths.
+                return [this.files[index], value] as [string, typeof value];
             } else {
                 this.raiseError(`Source file not found for ${this.files[index]}`);
             }
@@ -1844,6 +1972,7 @@ export class TestState {
             backgroundAnalysisProgramFactory,
             configOptions,
             fileSystem: this.fs,
+            libraryReanalysisTimeProvider: () => 0,
         });
 
         // directly set files to track rather than using fileSpec from config
@@ -1854,6 +1983,7 @@ export class TestState {
                     const fileExtension = getFileExtension(path).toLowerCase();
                     return fileExtension === '.py' || fileExtension === '.pyi';
                 })
+                .map((path) => Uri.file(path, this.serviceProvider))
                 .filter((path) => service.isTracked(path))
         );
 
@@ -1872,7 +2002,8 @@ export class TestState {
     }
 
     private async _waitForFile(filePath: string) {
-        while (!this.fs.existsSync(filePath)) {
+        const uri = Uri.file(filePath, this.serviceProvider);
+        while (!this.fs.existsSync(uri)) {
             await new Promise<void>((res) =>
                 setTimeout(() => {
                     res();
@@ -1890,7 +2021,7 @@ export class TestState {
 
         return this._hostSpecificFeatures.getCodeActionsForPosition(
             this.workspace,
-            file,
+            range.fileUri,
             textRange,
             CancellationToken.None
         );
@@ -1904,7 +2035,7 @@ export class TestState {
             // wait until the file exists
             await this._waitForFile(normalizedFilePath);
 
-            const actual = this.fs.readFileSync(normalizedFilePath, 'utf8');
+            const actual = this.fs.readFileSync(Uri.file(normalizedFilePath, this.serviceProvider), 'utf8');
             if (actual !== expected) {
                 this.raiseError(
                     `doesn't contain expected result: ${stringify(expected)}, actual: ${stringify(actual)}`
@@ -1994,13 +2125,13 @@ export function getNodeAtMarker(codeOrState: string | TestState, markerName = 'm
     const state = isString(codeOrState) ? parseAndGetTestState(codeOrState).state : codeOrState;
     const marker = state.getMarkerByName(markerName);
 
-    const sourceFile = state.program.getBoundSourceFile(marker.fileName);
+    const sourceFile = state.program.getBoundSourceFile(marker.fileUri);
     assert(sourceFile);
 
     const parserResults = sourceFile.getParseResults();
     assert(parserResults);
 
-    const node = findNodeByOffset(parserResults.parseTree, marker.position);
+    const node = findNodeByOffset(parserResults.parserOutput.parseTree, marker.position);
     assert(node);
 
     return node;

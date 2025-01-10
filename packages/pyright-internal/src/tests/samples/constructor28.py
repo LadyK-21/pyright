@@ -4,7 +4,7 @@
 # pyright: strict
 
 from __future__ import annotations
-from typing import Any, Callable, Generic, TypeVar, overload
+from typing import Any, Callable, Generic, Iterable, TypeVar, overload
 
 T = TypeVar("T")
 S = TypeVar("S", covariant=True)
@@ -39,8 +39,8 @@ def func2(arg1: ParentB[T], arg2: ParentB[T]) -> T:
     ...
 
 
-x1 = func2(ChildB(""), ChildB(1.2))
-reveal_type(x1, expected_text="str | float")
+# This should generate an error.
+func2(ChildB(""), ChildB(1.2))
 
 
 class ClassC(Generic[S]):
@@ -76,3 +76,7 @@ class ClassD(Generic[S]):
 
 
 func3(ClassD(""), ClassD(""))
+
+
+def func4(a: Iterable[tuple[str, ...]]):
+    zip(a, zip(*a))

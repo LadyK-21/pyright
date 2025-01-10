@@ -1,7 +1,7 @@
 # This sample tests various error conditions for the Self type
 
-from typing import Callable, TypeVar
-from typing_extensions import Self
+from typing import Callable, Generic, TypeVar
+from typing_extensions import Self  # pyright: ignore[reportMissingModuleSource]
 
 
 T = TypeVar("T")
@@ -29,6 +29,10 @@ def func2(a: Self) -> None:
 # This should generate an error because Self can't be used in this context.
 def func3() -> Self:
     ...
+
+
+def is_self(t: object):
+    return t is Self
 
 
 class B:
@@ -92,3 +96,25 @@ class C:
             return bar
 
         return inner
+
+
+class D(Generic[T]):
+    ...
+
+
+# This should generate an error because "Self" cannot be used
+# within a generic class definition.
+class E(D[Self]):
+    ...
+
+
+class MetaA(type):
+    # This should generate an error because "Self" isn't
+    # allowed in a metaclass.
+    def __new__(cls, *args: object) -> Self:
+        ...
+
+    # This should generate an error because "Self" isn't
+    # allowed in a metaclass.
+    def __mul__(cls, count: int) -> list[Self]:
+        ...

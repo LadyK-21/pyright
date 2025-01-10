@@ -5,30 +5,30 @@
  *
  * Shortcuts to common services.
  */
-import { ISourceFileFactory } from '../analyzer/program';
+import { CacheManager } from '../analyzer/cacheManager';
+import { ISourceFileFactory } from '../analyzer/programTypes';
 import { IPythonMode, SourceFile, SourceFileEditMode } from '../analyzer/sourceFile';
-import { SupportPartialStubs, SupportUriToPathMapping } from '../pyrightFileSystem';
+import { SupportPartialStubs } from '../pyrightFileSystem';
+import { ServiceKeys } from './serviceKeys';
+import { CaseSensitivityDetector } from './caseSensitivityDetector';
 import { ConsoleInterface } from './console';
-import { FileSystem } from './fileSystem';
+import { FileSystem, TempFile } from './fileSystem';
 import { LogTracker } from './logTracker';
-import { ServiceKey, ServiceProvider } from './serviceProvider';
+import { ServiceProvider } from './serviceProvider';
+import { Uri } from './uri/uri';
+import { DocStringService, PyrightDocStringService } from './docStringService';
+import { CommandService, WindowService } from './languageServerInterface';
 
 declare module './serviceProvider' {
     interface ServiceProvider {
         fs(): FileSystem;
         console(): ConsoleInterface;
+        tmp(): TempFile | undefined;
         sourceFileFactory(): ISourceFileFactory;
-        uriMapper(): SupportUriToPathMapping;
         partialStubs(): SupportPartialStubs;
+        cacheManager(): CacheManager | undefined;
+        docStringService(): DocStringService;
     }
-}
-
-export namespace ServiceKeys {
-    export const fs = new ServiceKey<FileSystem>();
-    export const console = new ServiceKey<ConsoleInterface>();
-    export const sourceFileFactory = new ServiceKey<ISourceFileFactory>();
-    export const partialStubs = new ServiceKey<SupportPartialStubs>();
-    export const uriMapper = new ServiceKey<SupportUriToPathMapping>();
 }
 
 export function createServiceProvider(...services: any): ServiceProvider {
@@ -48,8 +48,23 @@ export function createServiceProvider(...services: any): ServiceProvider {
         if (SupportPartialStubs.is(service)) {
             sp.add(ServiceKeys.partialStubs, service);
         }
-        if (SupportUriToPathMapping.is(service)) {
-            sp.add(ServiceKeys.uriMapper, service);
+        if (TempFile.is(service)) {
+            sp.add(ServiceKeys.tempFile, service);
+        }
+        if (CaseSensitivityDetector.is(service)) {
+            sp.add(ServiceKeys.caseSensitivityDetector, service);
+        }
+        if (CacheManager.is(service)) {
+            sp.add(ServiceKeys.cacheManager, service);
+        }
+        if (DocStringService.is(service)) {
+            sp.add(ServiceKeys.docStringService, service);
+        }
+        if (WindowService.is(service)) {
+            sp.add(ServiceKeys.windowService, service);
+        }
+        if (CommandService.is(service)) {
+            sp.add(ServiceKeys.commandService, service);
         }
     });
     return sp;
@@ -61,40 +76,48 @@ ServiceProvider.prototype.fs = function () {
 ServiceProvider.prototype.console = function () {
     return this.get(ServiceKeys.console);
 };
-ServiceProvider.prototype.uriMapper = function () {
-    return this.get(ServiceKeys.uriMapper);
-};
 ServiceProvider.prototype.partialStubs = function () {
     return this.get(ServiceKeys.partialStubs);
+};
+ServiceProvider.prototype.tmp = function () {
+    return this.tryGet(ServiceKeys.tempFile);
 };
 ServiceProvider.prototype.sourceFileFactory = function () {
     const result = this.tryGet(ServiceKeys.sourceFileFactory);
     return result || DefaultSourceFileFactory;
 };
 
+ServiceProvider.prototype.docStringService = function () {
+    const result = this.tryGet(ServiceKeys.docStringService);
+    return result || new PyrightDocStringService();
+};
+
+ServiceProvider.prototype.cacheManager = function () {
+    const result = this.tryGet(ServiceKeys.cacheManager);
+    return result;
+};
+
 const DefaultSourceFileFactory: ISourceFileFactory = {
     createSourceFile(
-        fs: FileSystem,
-        filePath: string,
+        serviceProvider: ServiceProvider,
+        fileUri: Uri,
         moduleName: string,
         isThirdPartyImport: boolean,
         isThirdPartyPyTypedPresent: boolean,
         editMode: SourceFileEditMode,
         console?: ConsoleInterface,
         logTracker?: LogTracker,
-        realFilePath?: string,
         ipythonMode?: IPythonMode
     ) {
         return new SourceFile(
-            fs,
-            filePath,
+            serviceProvider,
+            fileUri,
             moduleName,
             isThirdPartyImport,
             isThirdPartyPyTypedPresent,
             editMode,
             console,
             logTracker,
-            realFilePath,
             ipythonMode
         );
     },

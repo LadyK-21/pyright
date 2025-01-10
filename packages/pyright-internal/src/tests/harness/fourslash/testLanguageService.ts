@@ -6,36 +6,34 @@
  * Test mock that implements LanguageServiceInterface
  */
 
-import * as path from 'path';
 import { CancellationToken, CodeAction, ExecuteCommandParams } from 'vscode-languageserver';
 
 import {
     BackgroundAnalysisProgram,
     BackgroundAnalysisProgramFactory,
 } from '../../../analyzer/backgroundAnalysisProgram';
-import { CacheManager } from '../../../analyzer/cacheManager';
 import { ImportResolver, ImportResolverFactory } from '../../../analyzer/importResolver';
 import { MaxAnalysisTime } from '../../../analyzer/program';
-import { AnalyzerService } from '../../../analyzer/service';
+import { AnalyzerService, AnalyzerServiceOptions } from '../../../analyzer/service';
 import { BackgroundAnalysisBase } from '../../../backgroundAnalysisBase';
 import { CommandController } from '../../../commands/commandController';
 import { ConfigOptions } from '../../../common/configOptions';
 import { ConsoleInterface } from '../../../common/console';
 import * as debug from '../../../common/debug';
 import { FileSystem } from '../../../common/fileSystem';
+import { ServiceProvider } from '../../../common/serviceProvider';
 import { Range } from '../../../common/textRange';
-import { UriParser } from '../../../common/uriParser';
-import { LanguageServerInterface, MessageAction, ServerSettings, WindowInterface } from '../../../languageServerBase';
-import { CodeActionProvider } from '../../../languageService/codeActionProvider';
+import { Uri } from '../../../common/uri/uri';
 import {
-    WellKnownWorkspaceKinds,
-    Workspace,
-    WorkspacePythonPathKind,
-    createInitStatus,
-} from '../../../workspaceFactory';
+    LanguageServerInterface,
+    MessageAction,
+    ServerSettings,
+    WindowInterface,
+} from '../../../common/languageServerInterface';
+import { CodeActionProvider } from '../../../languageService/codeActionProvider';
+import { WellKnownWorkspaceKinds, Workspace, createInitStatus } from '../../../workspaceFactory';
 import { TestAccessHost } from '../testAccessHost';
 import { HostSpecificFeatures } from './testState';
-import { ServiceProvider } from '../../../common/serviceProvider';
 
 export class TestFeatures implements HostSpecificFeatures {
     importResolverFactory: ImportResolverFactory = AnalyzerService.createImportResolver;
@@ -45,8 +43,7 @@ export class TestFeatures implements HostSpecificFeatures {
         configOptions: ConfigOptions,
         importResolver: ImportResolver,
         backgroundAnalysis?: BackgroundAnalysisBase,
-        maxAnalysisTime?: MaxAnalysisTime,
-        cacheManager?: CacheManager
+        maxAnalysisTime?: MaxAnalysisTime
     ) =>
         new BackgroundAnalysisProgram(
             serviceId,
@@ -55,21 +52,16 @@ export class TestFeatures implements HostSpecificFeatures {
             importResolver,
             backgroundAnalysis,
             maxAnalysisTime,
-            /* disableChecker */ undefined,
-            cacheManager
+            /* disableChecker */ undefined
         );
-
-    runIndexer(workspace: Workspace, noStdLib: boolean, options?: string): void {
-        /* empty */
-    }
 
     getCodeActionsForPosition(
         workspace: Workspace,
-        filePath: string,
+        fileUri: Uri,
         range: Range,
         token: CancellationToken
     ): Promise<CodeAction[]> {
-        return CodeActionProvider.getCodeActionsForPosition(workspace, filePath, range, undefined, token);
+        return CodeActionProvider.getCodeActionsForPosition(workspace, fileUri, range, undefined, token);
     }
     execute(ls: LanguageServerInterface, params: ExecuteCommandParams, token: CancellationToken): Promise<any> {
         const controller = new CommandController(ls);
@@ -78,50 +70,52 @@ export class TestFeatures implements HostSpecificFeatures {
 }
 
 export class TestLanguageService implements LanguageServerInterface {
-    readonly rootPath = path.sep;
     readonly window = new TestWindow();
     readonly supportAdvancedEdits = true;
+    readonly serviceProvider: ServiceProvider;
 
     private readonly _workspace: Workspace;
     private readonly _defaultWorkspace: Workspace;
-    private readonly _uriParser: UriParser;
 
-    constructor(workspace: Workspace, readonly console: ConsoleInterface, readonly fs: FileSystem) {
+    constructor(
+        workspace: Workspace,
+        readonly console: ConsoleInterface,
+        readonly fs: FileSystem,
+        options?: AnalyzerServiceOptions
+    ) {
         this._workspace = workspace;
-        this._uriParser = new UriParser(this.fs);
+        this.serviceProvider = this._workspace.service.serviceProvider;
+
         this._defaultWorkspace = {
             workspaceName: '',
-            rootPath: '',
-            uri: '',
-            pythonPath: undefined,
-            pythonPathKind: WorkspacePythonPathKind.Mutable,
+            rootUri: undefined,
             kinds: [WellKnownWorkspaceKinds.Test],
-            service: new AnalyzerService('test service', new ServiceProvider(), {
-                console: this.console,
-                hostFactory: () => new TestAccessHost(),
-                importResolverFactory: AnalyzerService.createImportResolver,
-                configOptions: new ConfigOptions('.'),
-                fileSystem: this.fs,
-            }),
+            service: new AnalyzerService(
+                'test service',
+                new ServiceProvider(),
+                options ?? {
+                    console: this.console,
+                    hostFactory: () => new TestAccessHost(),
+                    importResolverFactory: AnalyzerService.createImportResolver,
+                    configOptions: new ConfigOptions(Uri.empty()),
+                    fileSystem: this.fs,
+                }
+            ),
             disableLanguageServices: false,
+            disableTaggedHints: false,
             disableOrganizeImports: false,
             disableWorkspaceSymbol: false,
             isInitialized: createInitStatus(),
             searchPathsToWatch: [],
-            pythonEnvironmentName: undefined,
         };
-    }
-
-    decodeTextDocumentUri(uriString: string): string {
-        return this._uriParser.decodeTextDocumentUri(uriString);
     }
 
     getWorkspaces(): Promise<Workspace[]> {
         return Promise.resolve([this._workspace, this._defaultWorkspace]);
     }
 
-    getWorkspaceForFile(filePath: string): Promise<Workspace> {
-        if (filePath.startsWith(this._workspace.rootPath)) {
+    getWorkspaceForFile(uri: Uri): Promise<Workspace> {
+        if (uri.startsWith(this._workspace.rootUri)) {
             return Promise.resolve(this._workspace);
         }
 
@@ -136,6 +130,7 @@ export class TestLanguageService implements LanguageServerInterface {
             openFilesOnly: this._workspace.service.getConfigOptions().checkOnlyOpenFiles,
             useLibraryCodeForTypes: this._workspace.service.getConfigOptions().useLibraryCodeForTypes,
             disableLanguageServices: this._workspace.disableLanguageServices,
+            disableTaggedHints: this._workspace.disableTaggedHints,
             autoImportCompletions: this._workspace.service.getConfigOptions().autoImportCompletions,
             functionSignatureDisplay: this._workspace.service.getConfigOptions().functionSignatureDisplay,
         };

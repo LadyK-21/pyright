@@ -2,7 +2,9 @@
 # when applied to a decorator function.
 
 from typing import Any, Callable, TypeVar, overload
-from typing_extensions import dataclass_transform
+from typing_extensions import (  # pyright: ignore[reportMissingModuleSource]
+    dataclass_transform,
+)
 
 _T = TypeVar("_T")
 
@@ -34,14 +36,14 @@ class Customer1:
     name: str
 
 
-@create_model
+@create_model(frozen=True)
 class Customer2:
     id: int
     name: str
 
 
-@create_model
-class Customer2Subclass(Customer2, frozen=True):
+@create_model(frozen=True)
+class Customer2Subclass(Customer2):
     salary: float
 
 
