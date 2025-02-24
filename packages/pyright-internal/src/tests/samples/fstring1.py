@@ -146,3 +146,14 @@ y"
 
 v2 = f'x \
 y'
+
+w1 = 1
+
+w2 = f"__{
+    w1:d
+}__"
+
+
+# This should generate an error because it's unterminated.
+w3 = f"test
+

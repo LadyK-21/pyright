@@ -8,6 +8,7 @@
  * completion suggestions, etc.
  */
 
+import { getBoundCallMethod } from '../analyzer/constructors';
 import { Declaration, DeclarationType, VariableDeclaration } from '../analyzer/declaration';
 import * as ParseTreeUtils from '../analyzer/parseTreeUtils';
 import { SourceMapper } from '../analyzer/sourceMapper';
@@ -16,17 +17,17 @@ import {
     getClassDocString,
     getFunctionDocStringInherited,
     getModuleDocString,
-    getModuleDocStringFromPaths,
-    getOverloadedFunctionDocStringsInherited,
+    getModuleDocStringFromUris,
+    getOverloadedDocStringsInherited,
     getPropertyDocStringInherited,
     getVariableDocString,
 } from '../analyzer/typeDocStringUtils';
 import { TypeEvaluator } from '../analyzer/typeEvaluatorTypes';
-import { ClassMemberLookupFlags, lookUpClassMember } from '../analyzer/typeUtils';
+import { MemberAccessFlags, lookUpClassMember } from '../analyzer/typeUtils';
 import {
     ClassType,
     FunctionType,
-    OverloadedFunctionType,
+    OverloadedType,
     Type,
     TypeBase,
     TypeCategory,
@@ -36,7 +37,7 @@ import {
     isFunction,
     isInstantiableClass,
     isModule,
-    isOverloadedFunction,
+    isOverloaded,
 } from '../analyzer/types';
 import { SignatureDisplayType } from '../common/configOptions';
 import { isDefined } from '../common/core';
@@ -51,12 +52,27 @@ export function getToolTipForType(
     name: string,
     evaluator: TypeEvaluator,
     isProperty: boolean,
-    functionSignatureDisplay: SignatureDisplayType
+    functionSignatureDisplay: SignatureDisplayType,
+    typeNode?: ExpressionNode
 ): string {
+    // Support __call__ method for class instances to show the signature of the method
+    if (type.category === TypeCategory.Class && isClassInstance(type) && typeNode) {
+        const callMethodResult = getBoundCallMethod(evaluator, typeNode, type);
+        if (
+            callMethodResult?.type.category === TypeCategory.Function ||
+            callMethodResult?.type.category === TypeCategory.Overloaded
+        ) {
+            // narrow down specific overload if possible
+            const methodType = bindFunctionToClassOrObjectToolTip(evaluator, typeNode, type, callMethodResult.type);
+            if (methodType) {
+                type = methodType;
+            }
+        }
+    }
     let signatureString = '';
-    if (isOverloadedFunction(type)) {
+    if (isOverloaded(type)) {
         signatureString = label.length > 0 ? `(${label})\n` : '';
-        signatureString += `${getOverloadedFunctionTooltip(type, evaluator, functionSignatureDisplay)}`;
+        signatureString += `${getOverloadedTooltip(type, evaluator, functionSignatureDisplay)}`;
     } else if (isFunction(type)) {
         signatureString = `${getFunctionTooltip(label, name, type, evaluator, isProperty, functionSignatureDisplay)}`;
     } else {
@@ -68,17 +84,17 @@ export function getToolTipForType(
 }
 
 // 70 is vscode's default hover width size.
-export function getOverloadedFunctionTooltip(
-    type: OverloadedFunctionType,
+export function getOverloadedTooltip(
+    type: OverloadedType,
     evaluator: TypeEvaluator,
     functionSignatureDisplay: SignatureDisplayType,
     columnThreshold = 70
 ) {
     let content = '';
-    const overloads = OverloadedFunctionType.getOverloads(type).map((o) =>
+    const overloads = OverloadedType.getOverloads(type).map((o) =>
         getFunctionTooltip(
             /* label */ '',
-            o.details.name,
+            o.shared.name,
             o,
             evaluator,
             /* isProperty */ false,
@@ -144,8 +160,8 @@ export function getConstructorTooltip(
     const classText = `class `;
     let signature = '';
 
-    if (isOverloadedFunction(type)) {
-        const overloads = type.overloads.map((overload) =>
+    if (isOverloaded(type)) {
+        const overloads = OverloadedType.getOverloads(type).map((overload) =>
             getConstructorTooltip(constructorName, overload, evaluator, functionSignatureDisplay)
         );
         overloads.forEach((overload, index) => {
@@ -177,29 +193,30 @@ function formatSignature(
 }
 
 export function getFunctionDocStringFromType(type: FunctionType, sourceMapper: SourceMapper, evaluator: TypeEvaluator) {
-    const decl = type.details.declaration;
+    const decl = type.shared.declaration;
     const enclosingClass = decl ? ParseTreeUtils.getEnclosingClass(decl.node) : undefined;
     const classResults = enclosingClass ? evaluator.getTypeOfClass(enclosingClass) : undefined;
 
     return getFunctionDocStringInherited(type, decl, sourceMapper, classResults?.classType);
 }
 
-export function getOverloadedFunctionDocStringsFromType(
-    type: OverloadedFunctionType,
+export function getOverloadedDocStringsFromType(
+    type: OverloadedType,
     sourceMapper: SourceMapper,
     evaluator: TypeEvaluator
 ) {
-    if (type.overloads.length === 0) {
+    const overloads = OverloadedType.getOverloads(type);
+    if (overloads.length === 0) {
         return [];
     }
 
-    const decl = type.overloads[0].details.declaration;
+    const decl = overloads[0].shared.declaration;
     const enclosingClass = decl ? ParseTreeUtils.getEnclosingClass(decl.node) : undefined;
     const classResults = enclosingClass ? evaluator.getTypeOfClass(enclosingClass) : undefined;
 
-    return getOverloadedFunctionDocStringsInherited(
+    return getOverloadedDocStringsInherited(
         type,
-        type.overloads.map((o) => o.details.declaration).filter(isDefined),
+        overloads.map((o) => o.shared.declaration).filter(isDefined),
         sourceMapper,
         evaluator,
 
@@ -213,22 +230,35 @@ function getDocumentationPartForTypeAlias(
     evaluator: TypeEvaluator,
     symbol?: Symbol
 ) {
-    if (resolvedDecl?.type === DeclarationType.Variable && resolvedDecl.typeAliasName && resolvedDecl.docString) {
+    if (!resolvedDecl) {
+        return undefined;
+    }
+
+    if (resolvedDecl.type === DeclarationType.TypeAlias) {
         return resolvedDecl.docString;
-    } else if (resolvedDecl?.type === DeclarationType.Variable) {
+    }
+
+    if (resolvedDecl.type === DeclarationType.Variable) {
+        if (resolvedDecl.typeAliasName && resolvedDecl.docString) {
+            return resolvedDecl.docString;
+        }
+
         const decl = (symbol?.getDeclarations().find((d) => d.type === DeclarationType.Variable && !!d.docString) ??
             resolvedDecl) as VariableDeclaration;
         const doc = getVariableDocString(decl, sourceMapper);
         if (doc) {
             return doc;
         }
-    } else if (resolvedDecl?.type === DeclarationType.Function) {
+    }
+
+    if (resolvedDecl.type === DeclarationType.Function) {
         // @property functions
         const doc = getPropertyDocStringInherited(resolvedDecl, sourceMapper, evaluator);
         if (doc) {
             return doc;
         }
     }
+
     return undefined;
 }
 
@@ -259,12 +289,12 @@ function getDocumentationPartForType(
                 return doc;
             }
         }
-    } else if (isOverloadedFunction(type)) {
+    } else if (isOverloaded(type)) {
         const functionType = boundObjectOrClass
             ? evaluator.bindFunctionToClassOrObject(boundObjectOrClass, type)
             : type;
-        if (functionType && isOverloadedFunction(functionType)) {
-            const doc = getOverloadedFunctionDocStringsFromType(functionType, sourceMapper, evaluator).find((d) => d);
+        if (functionType && isOverloaded(functionType)) {
+            const doc = getOverloadedDocStringsFromType(functionType, sourceMapper, evaluator).find((d) => d);
 
             if (doc) {
                 return doc;
@@ -301,16 +331,16 @@ export function getDocumentationPartsForTypeAndDecl(
             resolvedDecl.node &&
             resolvedDecl.node.nodeType === ParseNodeType.ImportAs &&
             !!optional?.name &&
-            !resolvedDecl.node.alias
+            !resolvedDecl.node.d.alias
         ) {
-            const name = resolvedDecl.node.module.nameParts.find((n) => n.value === optional.name);
+            const name = resolvedDecl.node.d.module.d.nameParts.find((n) => n.d.value === optional.name);
             if (name) {
-                const aliasDecls = evaluator.getDeclarationsForNameNode(name) ?? [resolvedDecl];
+                const aliasDecls = evaluator.getDeclInfoForNameNode(name)?.decls ?? [resolvedDecl];
                 resolvedDecl = aliasDecls.length > 0 ? aliasDecls[0] : resolvedDecl;
             }
         }
 
-        typeDoc = getModuleDocStringFromPaths([resolvedDecl.path], sourceMapper);
+        typeDoc = getModuleDocStringFromUris([resolvedDecl.uri], sourceMapper);
     }
 
     typeDoc =
@@ -348,9 +378,9 @@ export function combineExpressionTypes(typeNodes: ExpressionNode[], evaluator: T
         typeList.length === 1 &&
         result.category === TypeCategory.Class &&
         ClassType.isBuiltIn(result, 'list') &&
-        result.typeArguments
+        result.priv.typeArgs
     ) {
-        result = result.typeArguments[0];
+        result = result.priv.typeArgs[0];
     } else if (
         typeList.length === 1 &&
         result.category === TypeCategory.Class &&
@@ -369,7 +399,7 @@ export function getClassAndConstructorTypes(node: NameNode, evaluator: TypeEvalu
 
     // Allow the left to be a member access chain (e.g. a.b.c) if the
     // node in question is the last item in the chain.
-    if (callLeftNode?.parent?.nodeType === ParseNodeType.MemberAccess && node === callLeftNode.parent.memberName) {
+    if (callLeftNode?.parent?.nodeType === ParseNodeType.MemberAccess && node === callLeftNode.parent.d.member) {
         callLeftNode = node.parent;
         // Allow the left to be a generic class constructor (e.g. foo[int]())
     } else if (callLeftNode?.parent?.nodeType === ParseNodeType.Index) {
@@ -380,7 +410,7 @@ export function getClassAndConstructorTypes(node: NameNode, evaluator: TypeEvalu
         !callLeftNode ||
         !callLeftNode.parent ||
         callLeftNode.parent.nodeType !== ParseNodeType.Call ||
-        callLeftNode.parent.leftExpression !== callLeftNode
+        callLeftNode.parent.d.leftExpr !== callLeftNode
     ) {
         return;
     }
@@ -400,12 +430,12 @@ export function getClassAndConstructorTypes(node: NameNode, evaluator: TypeEvalu
 
     // Try to get the `__init__` method first because it typically has more type information than `__new__`.
     // Don't exclude `object.__init__` since in the plain case we want to show Foo().
-    const initMember = lookUpClassMember(classType, '__init__', ClassMemberLookupFlags.SkipInstanceVariables);
+    const initMember = lookUpClassMember(classType, '__init__', MemberAccessFlags.SkipInstanceMembers);
 
     if (initMember) {
         const functionType = evaluator.getTypeOfMember(initMember);
 
-        if (isFunction(functionType) || isOverloadedFunction(functionType)) {
+        if (isFunction(functionType) || isOverloaded(functionType)) {
             methodType = bindFunctionToClassOrObjectToolTip(evaluator, node, instanceType, functionType);
         }
     }
@@ -416,26 +446,26 @@ export function getClassAndConstructorTypes(node: NameNode, evaluator: TypeEvalu
         !methodType ||
         (methodType &&
             isFunction(methodType) &&
-            (FunctionType.hasDefaultParameters(methodType) || methodType.details.parameters.length === 0))
+            (FunctionType.hasDefaultParams(methodType) || methodType.shared.parameters.length === 0))
     ) {
         const newMember = lookUpClassMember(
             classType,
             '__new__',
-            ClassMemberLookupFlags.SkipObjectBaseClass | ClassMemberLookupFlags.SkipInstanceVariables
+            MemberAccessFlags.SkipObjectBaseClass | MemberAccessFlags.SkipInstanceMembers
         );
 
         if (newMember) {
             const newMemberType = evaluator.getTypeOfMember(newMember);
 
             // Prefer `__new__` if it doesn't have default params (*args: Any, **kwargs: Any) or no params ().
-            if (isFunction(newMemberType) || isOverloadedFunction(newMemberType)) {
-                // Set `treatConstructorAsClassMember` to true to exclude `cls` as a parameter.
+            if (isFunction(newMemberType) || isOverloaded(newMemberType)) {
+                // Set `treatConstructorAsClassMethod` to true to exclude `cls` as a parameter.
                 methodType = bindFunctionToClassOrObjectToolTip(
                     evaluator,
                     node,
                     instanceType,
                     newMemberType,
-                    /* treatConstructorAsClassMember */ true
+                    /* treatConstructorAsClassMethod */ true
                 );
             }
         }
@@ -448,16 +478,14 @@ export function bindFunctionToClassOrObjectToolTip(
     evaluator: TypeEvaluator,
     node: ExpressionNode,
     baseType: ClassType | undefined,
-    memberType: FunctionType | OverloadedFunctionType,
-    treatConstructorAsClassMember?: boolean
-): FunctionType | OverloadedFunctionType | undefined {
+    memberType: FunctionType | OverloadedType,
+    treatConstructorAsClassMethod?: boolean
+): FunctionType | OverloadedType | undefined {
     const methodType = evaluator.bindFunctionToClassOrObject(
         baseType,
         memberType,
         /* memberClass */ undefined,
-        /* errorNode */ undefined,
-        /* recursiveCount */ undefined,
-        treatConstructorAsClassMember
+        treatConstructorAsClassMethod
     );
 
     if (!methodType) {
@@ -471,11 +499,11 @@ export function limitOverloadBasedOnCall<T extends Type>(
     evaluator: TypeEvaluator,
     type: T,
     node: ExpressionNode
-): T | FunctionType | OverloadedFunctionType {
+): T | FunctionType | OverloadedType {
     // If it's an overloaded function, see if it's part of a call expression.
     // If so, we may be able to eliminate some of the overloads based on
     // the overload resolution.
-    if (!isOverloadedFunction(type) || node.nodeType !== ParseNodeType.Name) {
+    if (!isOverloaded(type) || node.nodeType !== ParseNodeType.Name) {
         return type;
     }
 
@@ -493,7 +521,7 @@ export function limitOverloadBasedOnCall<T extends Type>(
         return callTypeResult.overloadsUsedForCall[0];
     }
 
-    return OverloadedFunctionType.create(callTypeResult.overloadsUsedForCall);
+    return OverloadedType.create(callTypeResult.overloadsUsedForCall);
 }
 
 export function getTypeForToolTip(evaluator: TypeEvaluator, node: ExpressionNode) {

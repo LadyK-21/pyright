@@ -3,7 +3,7 @@
 # PEP 487.
 
 from datetime import datetime
-from typing import Any, Optional, Type
+from typing import Any, Optional, Type, TypedDict
 
 
 class ClassA:
@@ -13,13 +13,13 @@ class ClassA:
         super().__init_subclass__()
 
 
-# This should generate an error because param1 is
+# This should generate two errors because param1 is
 # the wrong type.
 class ClassB(ClassA, param1=0, param2=4):
     pass
 
 
-# This should generate an error because param2 is missing.
+# This should generate two errors because param2 is missing.
 class ClassC(ClassA, param1="0", param3=datetime.now()):
     pass
 
@@ -56,3 +56,20 @@ class ClassG:
 
 class ClassH(ClassG):
     pass
+
+
+# This should generate two errors because "a" is not present
+# in the object.__init_subclass__ method.
+class ClassI(a=3):
+    a: int
+
+
+class ClassJ:
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        cls.custom_attribute = 9
+
+
+class ClassJChild(ClassJ):
+    def __init__(self):
+        reveal_type(self.custom_attribute, expected_text="int")

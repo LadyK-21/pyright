@@ -9,11 +9,6 @@
  * (https://www.python.org/dev/peps/pep-0257/).
  */
 
-// Cleans the a docstring as inspect.cleandoc does.
-export function cleanDocString(rawString: string): string {
-    return cleanAndSplitDocString(rawString).join('\n');
-}
-
 export function cleanAndSplitDocString(rawString: string): string[] {
     // Remove carriage returns and replace tabs.
     const unescaped = rawString.replace(/\r/g, '').replace(/\t/g, '        ');
@@ -101,7 +96,7 @@ export function extractParameterDocumentation(functionDocString: string, paramNa
             return trimmedLine.substr(paramOffset);
         }
 
-        // Check for Google (variant 1) format
+        // Check for Google (variant 2) format
         paramOffset = trimmedLine.indexOf(paramName + ' (');
         if (paramOffset >= 0) {
             return trimmedLine.substr(paramOffset);

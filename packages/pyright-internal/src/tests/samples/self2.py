@@ -1,9 +1,9 @@
 # This sample tests the usage of the Self type.
 
-from typing import Callable, Generic, ParamSpec, Protocol, TypeVar
-from typing_extensions import Self
 from dataclasses import dataclass
+from typing import Callable, Generic, ParamSpec, Protocol, TypeVar
 
+from typing_extensions import Self  # pyright: ignore[reportMissingModuleSource]
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -154,7 +154,7 @@ class ReturnSelf:
 class ReturnConcreteShape:
     scale: float = 1.0
 
-    def set_scale(self, scale: float) -> "ReturnConcreteShape":
+    def set_scale(self, scale: float) -> Self:
         self.scale = scale
         return self
 
@@ -193,3 +193,11 @@ def main(
 
     # This should generate an error.
     accepts_shape(return_different_class)
+
+
+class StateManager:
+    def __init__(self) -> None:
+        self.state: list[Self] = self.get_state()
+
+    def get_state(self) -> list[Self]:
+        ...

@@ -6,7 +6,7 @@ from .actions import Action
 from .enums import AnnotationFlag, AnnotationName, FileAttachmentAnnotationName
 from .syntax import Destination, Name, PDFContentStream, PDFObject
 
-DEFAULT_ANNOT_FLAGS: Incomplete
+DEFAULT_ANNOT_FLAGS: tuple[AnnotationFlag, ...]
 
 class AnnotationMixin:
     type: Name
@@ -15,7 +15,7 @@ class AnnotationMixin:
     border: str
     f_t: Name | None
     v: Incomplete | None
-    f: int  # AnnotationFlags
+    f: int  # AnnotationFlags bitmask
     contents: str | None
     a: Action | None
     dest: Destination | None
@@ -27,6 +27,7 @@ class AnnotationMixin:
     name: AnnotationName | FileAttachmentAnnotationName | None
     ink_list: str | None
     f_s: str | None
+    d_a: str | None
     def __init__(
         self,
         subtype: str,
@@ -34,7 +35,7 @@ class AnnotationMixin:
         y: int,
         width: int,
         height: int,
-        flags: tuple[AnnotationFlag, ...] = ...,
+        flags: tuple[AnnotationFlag | str, ...] = ...,
         contents: str | None = None,
         dest: Destination | None = None,
         action: Action | None = None,
@@ -48,6 +49,7 @@ class AnnotationMixin:
         file_spec: str | None = None,
         field_type: str | None = None,
         value: Incomplete | None = None,
+        default_appearance: str | None = None,
     ) -> None: ...
 
 class PDFAnnotation(AnnotationMixin, PDFObject): ...

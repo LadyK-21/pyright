@@ -15,8 +15,7 @@ import {
     FunctionType,
     ModuleType,
     NeverType,
-    NoneType,
-    OverloadedFunctionType,
+    OverloadedType,
     Type,
     TypeCategory,
     TypeVarType,
@@ -51,7 +50,7 @@ export class TypeWalker {
 
         this._recursionCount++;
 
-        if (type.typeAliasInfo) {
+        if (type.props?.typeAliasInfo) {
             this.visitTypeAlias(type);
         }
 
@@ -68,10 +67,6 @@ export class TypeWalker {
                 this.visitUnknown(type);
                 break;
 
-            case TypeCategory.None:
-                this.visitNone(type);
-                break;
-
             case TypeCategory.Never:
                 this.visitNever(type);
                 break;
@@ -80,8 +75,8 @@ export class TypeWalker {
                 this.visitFunction(type);
                 break;
 
-            case TypeCategory.OverloadedFunction:
-                this.visitOverloadedFunction(type);
+            case TypeCategory.Overloaded:
+                this.visitOverloaded(type);
                 break;
 
             case TypeCategory.Class:
@@ -112,10 +107,11 @@ export class TypeWalker {
     }
 
     visitTypeAlias(type: Type) {
-        assert(type.typeAliasInfo);
+        const aliasInfo = type.props?.typeAliasInfo;
+        assert(aliasInfo !== undefined);
 
-        if (type.typeAliasInfo.typeArguments) {
-            for (const typeArg of type.typeAliasInfo.typeArguments) {
+        if (aliasInfo.typeArgs) {
+            for (const typeArg of aliasInfo.typeArgs) {
                 this.walk(typeArg);
                 if (this._isWalkCanceled) {
                     break;
@@ -136,19 +132,15 @@ export class TypeWalker {
         // Nothing to do.
     }
 
-    visitNone(type: NoneType): void {
-        // Nothing to do.
-    }
-
     visitNever(type: NeverType): void {
         // Nothing to do.
     }
 
     visitFunction(type: FunctionType): void {
-        for (let i = 0; i < type.details.parameters.length; i++) {
+        for (let i = 0; i < type.shared.parameters.length; i++) {
             // Ignore parameters such as "*" that have no name.
-            if (type.details.parameters[i].name) {
-                const paramType = FunctionType.getEffectiveParameterType(type, i);
+            if (type.shared.parameters[i].name) {
+                const paramType = FunctionType.getParamType(type, i);
                 this.walk(paramType);
                 if (this._isWalkCanceled) {
                     break;
@@ -157,25 +149,31 @@ export class TypeWalker {
         }
 
         if (!this._isWalkCanceled && !FunctionType.isParamSpecValue(type) && !FunctionType.isParamSpecValue(type)) {
-            const returnType = type.details.declaredReturnType ?? type.inferredReturnType;
+            const returnType = type.shared.declaredReturnType ?? type.priv.inferredReturnType?.type;
             if (returnType) {
                 this.walk(returnType);
             }
         }
     }
 
-    visitOverloadedFunction(type: OverloadedFunctionType): void {
-        for (const overload of type.overloads) {
+    visitOverloaded(type: OverloadedType): void {
+        const overloads = OverloadedType.getOverloads(type);
+        for (const overload of overloads) {
             this.walk(overload);
             if (this._isWalkCanceled) {
                 break;
             }
         }
+
+        const impl = OverloadedType.getImplementation(type);
+        if (impl) {
+            this.walk(impl);
+        }
     }
 
     visitClass(type: ClassType): void {
         if (!ClassType.isPseudoGenericClass(type)) {
-            const typeArgs = type.tupleTypeArguments?.map((t) => t.type) || type.typeArguments;
+            const typeArgs = type.priv.tupleTypeArgs?.map((t) => t.type) || type.priv.typeArgs;
             if (typeArgs) {
                 for (const argType of typeArgs) {
                     this.walk(argType);
@@ -192,7 +190,7 @@ export class TypeWalker {
     }
 
     visitUnion(type: UnionType): void {
-        for (const subtype of type.subtypes) {
+        for (const subtype of type.priv.subtypes) {
             this.walk(subtype);
             if (this._isWalkCanceled) {
                 break;

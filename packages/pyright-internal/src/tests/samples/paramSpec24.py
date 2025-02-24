@@ -2,13 +2,20 @@
 # is used as an input parameter to a function that returns a generic
 # type parameterized by a ParamSpec and specialized with a Concatenate.
 
+# pyright: reportOverlappingOverload=false
+
 from __future__ import annotations
-from typing_extensions import Self, Concatenate, ParamSpec
+from typing_extensions import (  # pyright: ignore[reportMissingModuleSource]
+    Self,
+    Concatenate,
+    ParamSpec,
+)
 from typing import Any, Callable, TypeVar, Protocol, Generic, overload
 
 T = TypeVar("T")
 O = TypeVar("O")
 P = ParamSpec("P")
+Self_A = TypeVar("Self_A", bound="A")
 
 
 class _callable_cache(Protocol[P, T]):
@@ -35,7 +42,7 @@ class _wrapped_cache(_callable_cache[P, T], Generic[O, P, T]):
 
 
 @overload
-def cache(fn: Callable[Concatenate[A, P], T]) -> _wrapped_cache[A, P, T]:  # type: ignore
+def cache(fn: Callable[Concatenate[Self_A, P], T]) -> _wrapped_cache[Self_A, P, T]:  # type: ignore
     ...
 
 
