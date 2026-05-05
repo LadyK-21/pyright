@@ -29,7 +29,6 @@
         "@rspack/cli": "^1.7.2",
         "@rspack/core": "^1.7.2",
         "@types/node": "^22.19.6",
-        "copy-webpack-plugin": "^12.0.2",
         "esbuild-loader": "^4.4.2",
         "shx": "^0.4.0",
         "ts-loader": "^9.5.4",
@@ -44,5 +43,8 @@
     "bin": {
         "pyright": "index.js",
         "pyright-langserver": "langserver.index.js"
+    },
+    "overrides": {
+        "tar": "7.5.11"
     }
 }
